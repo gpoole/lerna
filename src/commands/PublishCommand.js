@@ -267,14 +267,27 @@ class PublishCommand extends Command {
 
     this.updateUpdatedPackages();
 
-    if (this.gitEnabled) {
-      this.commitAndTagUpdates();
-    }
-
     if (this.options.skipNpm) {
       callback(null, true);
     } else {
-      this.publishPackagesToNpm(callback);
+      this.publishPackagesToNpm(publishError => {
+        if (publishError) {
+          callback(publishError);
+          return;
+        }
+
+        if (this.gitEnabled) {
+          this.commitAndTagUpdates();
+        }
+
+        if (this.gitEnabled) {
+          this.logger.info("git", "Pushing tags...");
+          GitUtilities.pushWithTags(this.gitRemote, this.tags, this.execOpts);
+        }
+
+        this.logger.success("publish", "finished");
+        callback(null, true);
+      });
     }
   }
 
@@ -287,13 +300,14 @@ class PublishCommand extends Command {
         return;
       }
 
-      if (this.options.canary) {
-        this.logger.info("canary", "Resetting git state");
-        // reset since the package.json files are changed
-        this.repository.packageConfigs.forEach(pkgGlob => {
-          GitUtilities.checkoutChanges(`${pkgGlob}/package.json`, this.execOpts);
-        });
-      }
+      // FIXME: I guess this would break with my changes, disabling for now
+      // if (this.options.canary) {
+      //   this.logger.info("canary", "Resetting git state");
+      //   // reset since the package.json files are changed
+      //   this.repository.packageConfigs.forEach(pkgGlob => {
+      //     GitUtilities.checkoutChanges(`${pkgGlob}/package.json`, this.execOpts);
+      //   });
+      // }
 
       this.npmUpdateAsLatest(updateError => {
         if (updateError) {
@@ -301,18 +315,12 @@ class PublishCommand extends Command {
           return;
         }
 
-        if (this.gitEnabled) {
-          this.logger.info("git", "Pushing tags...");
-          GitUtilities.pushWithTags(this.gitRemote, this.tags, this.execOpts);
-        }
-
         const message = this.packagesToPublish.map(pkg => ` - ${pkg.name}@${pkg.version}`);
 
         output("Successfully published:");
         output(message.join(os.EOL));
 
-        this.logger.success("publish", "finished");
-        callback(null, true);
+        callback();
       });
     });
   }
@@ -640,10 +648,54 @@ class PublishCommand extends Command {
 
     // exec version lifecycle in root (after all updates)
     this.runSyncScriptInPackage(this.repository.package, "version");
+  }
 
-    if (this.gitEnabled) {
-      changedFiles.forEach(file => GitUtilities.addFile(file, this.execOpts));
-    }
+  // FIXME: take this out
+  // updateLockfiles(callback) {
+  //   const changedFiles = [];
+
+  //   PackageUtilities.runParallelBatches(
+  //     [this.updates.map(update => update.package)],
+  //     pkg => cb => {
+  //       this.updatePackageManagerLockfile(pkg, err => {
+  //         if (err) {
+  //           cb(err);
+  //           return;
+  //         }
+
+  //         changedFiles.push(path.join(pkg.location, "yarn.lock"));
+  //         cb();
+  //       });
+  //     },
+  //     4,
+  //     err => {
+  //       if (err) {
+  //         callback(err);
+  //       }
+
+  //       if (this.gitEnabled) {
+  //         changedFiles.forEach(file => GitUtilities.addFile(file, this.execOpts));
+  //       }
+
+  //       callback();
+  //     }
+  //   );
+  // }
+
+  updatePackageManagerLockfile(pkg, callback) {
+    const tracker = this.logger.newItem(`Install to regenerate lockfile for ${pkg.name}`);
+    NpmUtilities.installInDirOriginalPackageJson(pkg.location, this.npmConfig, err => {
+      if (err) {
+        callback(err);
+        return;
+      }
+
+      GitUtilities.addFile(path.join(pkg.location, "yarn.lock"), this.execOpts);
+
+      tracker.info("hoist", "Finished installing");
+      tracker.completeWork(1);
+      callback();
+    });
   }
 
   updatePackageDepsObject(pkg, depsKey, exact) {
@@ -728,41 +780,53 @@ class PublishCommand extends Command {
     PackageUtilities.runParallelBatches(
       this.batchedPackagesToPublish,
       pkg => {
-        let attempts = 0;
-
-        const run = cb => {
-          tracker.verbose("publishing", pkg.name);
-
-          NpmUtilities.publishTaggedInDir(tag, pkg, this.npmConfig, err => {
-            // FIXME: this err.stack conditional is too cute
-            err = (err && err.stack) || err; // eslint-disable-line no-param-reassign
-
-            if (
-              !err ||
-              // publishing over an existing package which is likely due to a timeout or something
-              err.indexOf("You cannot publish over the previously published version") > -1
-            ) {
-              tracker.info("published", pkg.name);
-              tracker.completeWork(1);
-              this.execScript(pkg, "postpublish");
-              cb();
+        return cb => {
+          this.updatePackageManagerLockfile(pkg, updateError => {
+            if (updateError) {
+              cb(updateError);
               return;
             }
 
-            attempts += 1;
+            let attempts = 0;
 
-            if (attempts < 5) {
-              this.logger.error("publish", "Retrying failed publish:", pkg.name);
-              this.logger.verbose("publish error", err.message);
-              run(cb);
-            } else {
-              this.logger.error("publish", "Ran out of retries while publishing", pkg.name, err.stack || err);
-              cb(err);
-            }
+            const run = () => {
+              tracker.verbose("publishing", pkg.name);
+              NpmUtilities.publishTaggedInDir(tag, pkg, this.npmConfig, err => {
+                // FIXME: this err.stack conditional is too cute
+                err = (err && err.stack) || err; // eslint-disable-line no-param-reassign
+
+                if (
+                  !err ||
+                  // publishing over an existing package which is likely due to a timeout or something
+                  err.indexOf("You cannot publish over the previously published version") > -1
+                ) {
+                  tracker.info("published", pkg.name);
+                  tracker.completeWork(1);
+                  this.execScript(pkg, "postpublish");
+                  cb();
+                  return;
+                }
+
+                attempts += 1;
+
+                if (attempts < 5) {
+                  this.logger.error("publish", "Retrying failed publish:", pkg.name);
+                  this.logger.verbose("publish error", err.message);
+                  run();
+                } else {
+                  this.logger.error(
+                    "publish",
+                    "Ran out of retries while publishing",
+                    pkg.name,
+                    err.stack || err
+                  );
+                  cb(err);
+                }
+              });
+            };
+            run();
           });
-        };
-
-        return run;
+        }
       },
       this.concurrency,
       err => {
