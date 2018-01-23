@@ -107,6 +107,13 @@ exports.builder = {
     type: "string",
     requiresArg: true,
   },
+  "update-lockfile": {
+    group: "Command options:",
+    describe:
+      "Whether to run the configure package manager's install after publishing to update the lockfile.",
+    type: "boolean",
+    default: false,
+  },
   preid: {
     group: "Command Options:",
     describe: "Specify the prerelease identifier (major.minor.patch-pre).",
@@ -650,38 +657,6 @@ class PublishCommand extends Command {
     this.runSyncScriptInPackage(this.repository.package, "version");
   }
 
-  // FIXME: take this out
-  // updateLockfiles(callback) {
-  //   const changedFiles = [];
-
-  //   PackageUtilities.runParallelBatches(
-  //     [this.updates.map(update => update.package)],
-  //     pkg => cb => {
-  //       this.updatePackageManagerLockfile(pkg, err => {
-  //         if (err) {
-  //           cb(err);
-  //           return;
-  //         }
-
-  //         changedFiles.push(path.join(pkg.location, "yarn.lock"));
-  //         cb();
-  //       });
-  //     },
-  //     4,
-  //     err => {
-  //       if (err) {
-  //         callback(err);
-  //       }
-
-  //       if (this.gitEnabled) {
-  //         changedFiles.forEach(file => GitUtilities.addFile(file, this.execOpts));
-  //       }
-
-  //       callback();
-  //     }
-  //   );
-  // }
-
   updatePackageManagerLockfile(pkg, callback) {
     const tracker = this.logger.newItem(`Install to regenerate lockfile for ${pkg.name}`);
     NpmUtilities.installInDirOriginalPackageJson(pkg.location, this.npmConfig, err => {
@@ -690,9 +665,9 @@ class PublishCommand extends Command {
         return;
       }
 
-      GitUtilities.addFile(path.join(pkg.location, "yarn.lock"), this.execOpts);
+      GitUtilities.addFile(NpmUtilities.getLockFilePath(pkg.location, this.npmConfig), this.execOpts);
 
-      tracker.info("hoist", "Finished installing");
+      tracker.info("hoist", `Finished updating lockfile for ${pkg.name}`);
       tracker.completeWork(1);
       callback();
     });
@@ -779,53 +754,51 @@ class PublishCommand extends Command {
 
     PackageUtilities.runParallelBatches(
       this.batchedPackagesToPublish,
-      pkg => {
-        return cb => {
+      pkg => cb => {
+        let attempts = 0;
+
+        const doPublish = () => {
+          tracker.verbose("publishing", pkg.name);
+          NpmUtilities.publishTaggedInDir(tag, pkg, this.npmConfig, err => {
+            // FIXME: this err.stack conditional is too cute
+            err = (err && err.stack) || err; // eslint-disable-line no-param-reassign
+
+            if (
+              !err ||
+              // publishing over an existing package which is likely due to a timeout or something
+              err.indexOf("You cannot publish over the previously published version") > -1
+            ) {
+              tracker.info("published", pkg.name);
+              tracker.completeWork(1);
+              this.execScript(pkg, "postpublish");
+              cb();
+              return;
+            }
+
+            attempts += 1;
+
+            if (attempts < 5) {
+              this.logger.error("publish", "Retrying failed publish:", pkg.name);
+              this.logger.verbose("publish error", err.message);
+              doPublish();
+            } else {
+              this.logger.error("publish", "Ran out of retries while publishing", pkg.name, err.stack || err);
+              cb(err);
+            }
+          });
+        };
+
+        if (this.options.updateLockfile) {
           this.updatePackageManagerLockfile(pkg, updateError => {
             if (updateError) {
               cb(updateError);
               return;
             }
 
-            let attempts = 0;
-
-            const run = () => {
-              tracker.verbose("publishing", pkg.name);
-              NpmUtilities.publishTaggedInDir(tag, pkg, this.npmConfig, err => {
-                // FIXME: this err.stack conditional is too cute
-                err = (err && err.stack) || err; // eslint-disable-line no-param-reassign
-
-                if (
-                  !err ||
-                  // publishing over an existing package which is likely due to a timeout or something
-                  err.indexOf("You cannot publish over the previously published version") > -1
-                ) {
-                  tracker.info("published", pkg.name);
-                  tracker.completeWork(1);
-                  this.execScript(pkg, "postpublish");
-                  cb();
-                  return;
-                }
-
-                attempts += 1;
-
-                if (attempts < 5) {
-                  this.logger.error("publish", "Retrying failed publish:", pkg.name);
-                  this.logger.verbose("publish error", err.message);
-                  run();
-                } else {
-                  this.logger.error(
-                    "publish",
-                    "Ran out of retries while publishing",
-                    pkg.name,
-                    err.stack || err
-                  );
-                  cb(err);
-                }
-              });
-            };
-            run();
+            doPublish();
           });
+        } else {
+          doPublish();
         }
       },
       this.concurrency,

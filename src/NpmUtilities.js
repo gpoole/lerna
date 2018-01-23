@@ -37,6 +37,13 @@ function execInstall(directory, { registry, npmClient, npmClientArgs, npmGlobalS
   return ChildProcessUtilities.exec(cmd, args, opts);
 }
 
+function getLockFilePath(directory, { npmClient }) {
+  if (npmClient === "yarn") {
+    return path.join(directory, "yarn.lock");
+  }
+  return path.join(directory, "package-lock.json");
+}
+
 function installInDir(directory, dependencies, config, callback) {
   log.silly("installInDir", path.basename(directory), dependencies);
 
@@ -179,3 +186,4 @@ exports.runScriptInDirSync = runScriptInDirSync;
 exports.runScriptInPackageStreaming = runScriptInPackageStreaming;
 exports.publishTaggedInDir = publishTaggedInDir;
 exports.getExecOpts = getExecOpts;
+exports.getLockFilePath = getLockFilePath;
